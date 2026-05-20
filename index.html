@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Elite Reverse Image Search Engine</title>
+    <style>
+        :root {
+            --bg-color: #0d1117;
+            --card-bg: #161b22;
+            --accent: #58a6ff;
+            --text: #c9d1d9;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text);
+            margin: 0;
+            padding: 40px 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .container {
+            max-width: 800px;
+            width: 100%;
+            text-align: center;
+        }
+        h1 { color: #ffffff; margin-bottom: 8px; }
+        .status-box {
+            background: var(--card-bg);
+            border: 1px solid #30363d;
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 24px;
+            font-size: 14px;
+        }
+        .upload-zone {
+            border: 2px dashed #30363d;
+            padding: 40px;
+            border-radius: 8px;
+            background: var(--card-bg);
+            cursor: pointer;
+            transition: border-color 0.2s;
+            margin-bottom: 32px;
+        }
+        .upload-zone:hover { border-color: var(--accent); }
+        input[type="file"] { display: none; }
+        .results-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 20px;
+            width: 100%;
+            margin-top: 20px;
+        }
+        .card {
+            background: var(--card-bg);
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 12px;
+            text-align: center;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+        .card img {
+            width: 100%;
+            height: 180px;
+            object-fit: contain;
+            border-radius: 4px;
+            background: #000;
+        }
+        .score-badge {
+            background: #238636;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+            display: inline-block;
+            margin: 8px 0;
+        }
+        .filename {
+            font-size: 12px;
+            word-break: break-all;
+            color: #8b949e;
+        }
+    </style>
+
+    <!-- Load Transformers.js module directly from CDN -->
+    <script type="module">
+        import { pipeline, cosineSimilarity } from 'https://jsdelivr.net';
+        
+        let extractor;
+        let imageIndex = [];
+
+        // Initialize the browser model and load database JSON file
+        async function init() {
+            const status = document.getElementById('status');
+            try {
+                status.innerText = "⏳ Loading CLIP AI Model into browser memory (approx. 150MB)...";
+                extractor = await pipeline('feature-extraction', 'Xenova/clip-vit-base-patch32');
+                
+                status.innerText = "⏳ Downloading image index database...";
+                const response = await fetch('./image_index.json');
+                if (!response.ok) throw new Error("image_index.json not found. Run your GitHub Action first!");
+                imageIndex = await response.json();
+                
+                status.innerText = "✅ System ready. Upload a product image to search.";
+                document.getElementById('file-input').disabled = false;
+            } catch (err) {
+                status.style.color = "#f85149";
+                status.innerText = `❌ Error: ${err.message}`;
+            }
+        }
+
+        // Helper function to programmatically rotate an image inside an HTML canvas
+        function rotateImageCanvas(imgElement, degrees) {
+            return new Promise((resolve) => {
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                if (degrees === 90 || degrees === 270) {
+                    canvas.width = imgElement.naturalHeight;
+                    canvas.height = imgElement.naturalWidth;
+                } else {
+                    canvas.width = imgElement.naturalWidth;
+                    canvas.height = imgElement.naturalHeight;
+                }
+                ctx.clearRect(0,0,canvas.width,canvas.height);
+                ctx.translate(canvas.width/2, canvas.height/2);
+                ctx.rotate((degrees * Math.PI) / 180);
+                ctx.drawImage(imgElement, -imgElement.naturalWidth/2, -imgElement.naturalHeight/2);
+                resolve(canvas.toDataURL('image/jpeg'));
+            });
+        }
+
+        async function performSearch(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const status = document.getElementById('status');
+            const resultsGrid = document.getElementById('results-grid');
+            status.innerText = "⚡ Analyzing image layout...";
+            resultsGrid.innerHTML = '';
+
+            // Load file into hidden img tag to read dimensions and feed canvas
+            const originalUrl = URL.createObjectURL(file);
+            const tempImg = new Image();
+            tempImg.src = originalUrl;
+            
+            tempImg.onload = async () => {
+                try {
+                    // Define rotation targets to beat angle offsets (e.g. 25 deg real vs 90 deg ref)
+                    const angles = [0, 90, 180, 270];
+                    let maxScores = {}; 
+
+                    for (let angle of angles) {
+                        status.innerText = `⚡ Extracting features (Checking ${angle}° orientation)...`;
+                        const rotatedDataUrl = await rotateImageCanvas(tempImg, angle);
+                        
+                        // Extract feature embeddings from this specific rotation variant
+                        const output = await extractor(rotatedDataUrl);
+                        const queryVector = Array.from(output.data);
+
+                        // Compare against database vectors
+                        imageIndex.forEach(item => {
+                            const score = cosineSimilarity(queryVector, item.vector);
+                            // Only preserve the absolute highest score across all evaluated orientations
+                            if (!maxScores[item.filename] || score > maxScores[item.filename]) {
+                                maxScores[item.filename] = score;
+                            }
+                        });
+                    }
+
+                    // Convert map results back into a sorted array
+                    const sortedResults = Object.keys(maxScores).map(filename => ({
+                        filename: filename,
+                        score: maxScores[filename]
+                    })).sort((a, b) => b.score - a.score);
+
+                    // Render out the Top 6 matching items
+                    status.innerText = `🎯 Search complete! Found matches.`;
+                    sortedResults.slice(0, 6).forEach(match => {
+                        const card = document.createElement('div');
+                        card.className = 'card';
+                        card.innerHTML = `
+                            <img src="./images/${match.filename}" alt="product match">
+                            <div class="score-badge">${(match.score * 100).toFixed(1)}% Match</div>
+                            <div class="filename">${match.filename}</div>
+                        `;
+                        resultsGrid.appendChild(card);
+                    });
+
+                } catch (err) {
+                    status.style.color = "#f85149";
+                    status.innerText = `❌ Error running search pipeline: ${err.message}`;
+                }
+            };
+        }
+
+        window.onload = init;
+        document.getElementById('file-input').addEventListener('change', performSearch);
+    </script>
+</head>
+<body>
+
+<div class="container">
+    <h1>📸 Core Reverse Image Engine</h1>
+    <p style="color: #8b949e; margin-top: 0;">Serverless AI Feature Extraction & Vector Query Pipeline</p>
+    
+    <div class="status-box" id="status">Initializing system modules...</div>
+
+    <label class="upload-zone" for="file-input">
+        <div style="font-size: 48px; margin-bottom: 10px;">📤</div>
+        <strong>Drop query photo here</strong><br>
+        <span style="font-size: 13px; color: #8b949e;">or click to browse local files</span>
+        <input type="file" id="file-input" accept="image/*" disabled />
+    </label>
+
+    <h3 style="text-align: left; border-bottom: 1px solid #30363d; padding-bottom: 8px;">Top Engine Match Results</h3>
+    <div class="results-grid" id="results-grid"></div>
+</div>
+
+</body>
+</html>
